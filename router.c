@@ -1,6 +1,7 @@
 #include "queue.h"
 #include "lib.h"
 #include "protocols.h"
+#include <arpa/inet.h>
 
 
 struct route_table_entry *get_best_route(uint32_t ip_dest, struct route_table_entry *rtable, int rtable_len) {
@@ -21,6 +22,20 @@ struct arp_table_entry *get_arp_entry(uint32_t ip, struct arp_table_entry *arp_t
 	return NULL;		
 }
 
+int compare_rtable_entries(const void *a, const void *b) {
+
+    const struct route_table_entry *entry1 = (const struct route_table_entry *)a;
+    const struct route_table_entry *entry2 = (const struct route_table_entry *)b;
+
+    // prefix comparison
+    if (ntohl(entry1->prefix) != ntohl(entry2->prefix))
+        return (ntohl(entry1->prefix) > ntohl(entry2->prefix)) ? -1 : 1;
+    
+	// mask comparison
+    return (ntohl(entry1->mask) > ntohl(entry2->mask)) ? -1 : 1;
+}
+
+
 int main(int argc, char *argv[])
 {
 	char buf[MAX_PACKET_LEN];
@@ -33,6 +48,8 @@ int main(int argc, char *argv[])
 
 	int rtable_len = read_rtable(argv[1], rtable);
 	int arp_table_len = parse_arp_table("arp_table.txt", arp_table);
+
+	qsort(rtable, rtable_len, sizeof(struct route_table_entry), compare_rtable_entries);
 
 	while (1) {
 
