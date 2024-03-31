@@ -46,6 +46,13 @@ struct arp_table_entry {
     uint8_t mac[6];
 };
 
+struct packet_cache {
+	char *buf;
+	size_t len;
+	int interface;
+	uint32_t next_hop;
+};
+
 char *get_interface_ip(int interface);
 
 /**
