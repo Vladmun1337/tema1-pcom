@@ -150,6 +150,8 @@ void send_ip_packet(int interface, char *buf, int len) {
 	struct ether_header *eth_hdr = (struct ether_header *) buf;
 	struct iphdr *ip_header = (struct iphdr *)(buf + sizeof(struct ether_header));
 
+	
+
 	// Bad checksum, ignore
 	if(checksum((uint16_t *) ip_header, sizeof(struct iphdr)) != 0)
 		return;
@@ -205,6 +207,40 @@ void send_ip_packet(int interface, char *buf, int len) {
 	send_to_link(best_route->interface, buf, len);
 }
 
+
+void echo_back(int interface, char *buf, int len) {
+	struct iphdr *ip_header = (struct iphdr *)(buf + sizeof(struct ether_header));
+	struct icmphdr *icmp_header = (struct icmphdr *)(buf + sizeof(struct ether_header) + sizeof(struct iphdr));
+
+	//icmp_header->checksum = 0;
+	//icmp_header->checksum = htons(checksum((uint16_t *) icmp_header, sizeof(struct icmphdr)));
+
+	// switch ip source and destination
+
+	icmp_header->type = 0;
+	icmp_header->code = 0;
+
+	uint32_t aux_addr = ip_header->saddr;
+	ip_header->saddr = ip_header->daddr;
+	ip_header->daddr = aux_addr;
+
+
+	ip_header->check = 0;
+	ip_header->check = htons(checksum((uint16_t *) ip_header, sizeof(struct iphdr)));
+
+	ip_header->protocol = IPPROTO_ICMP;
+
+	// switch icmp type and code for echo reply
+	icmp_header->checksum = 0;
+	icmp_header->checksum = htons(checksum((uint16_t *) icmp_header, sizeof(struct icmphdr)));
+
+	// redo ethernet header to send back
+	// memcpy(eth_hdr->ether_dhost, eth_hdr->ether_shost, 6);
+	// get_interface_mac(interface, eth_hdr->ether_shost);
+
+	send_ip_packet(interface, buf, len);
+}
+
 int main(int argc, char *argv[])
 {
 	char buf[MAX_PACKET_LEN];
@@ -240,6 +276,11 @@ int main(int argc, char *argv[])
 
 		if(ntohs(eth_hdr->ether_type) == IP_ETHTYPE) {
 
+			if(((struct iphdr*) (buf + sizeof(struct ether_header)))->daddr == inet_addr(get_interface_ip(interface))) {
+				echo_back(interface, buf, len);
+				continue;
+			}
+	
 			send_ip_packet(interface, buf, len);
 
 		} else if(ntohs(eth_hdr->ether_type) == ARP_ETHTYPE) {
