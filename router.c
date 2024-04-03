@@ -9,7 +9,8 @@
 #define OP_REQUEST 1
 #define OP_REPLY 2
 #define HTYPE_ETHER 1
-
+#define TIMEOUT 11
+#define NO_HOST 3
 
 struct route_table_entry *rtable;
 struct arp_table_entry *arp_table;
@@ -18,13 +19,41 @@ int arp_table_len;
 queue q;
 int q_len;
 
-struct route_table_entry *get_best_route(uint32_t ip_dest) {
+// struct route_table_entry *get_best_route(uint32_t ip_dest) {
 
-	for(int i = 0; i < rtable_len; i++)
-		if((ip_dest & rtable[i].mask) == rtable[i].prefix)
-			return &rtable[i];
+// 	for(int i = 0; i < rtable_len; i++)
+// 		if((ip_dest & rtable[i].mask) == rtable[i].prefix)
+// 			return &rtable[i];
 
-	return NULL;
+// 	return NULL;
+// }
+
+struct route_table_entry *get_best_route(uint32_t ip) {
+
+	struct route_table_entry *my_entry = NULL;
+
+	int left = 0;
+	int right = rtable_len - 1;
+
+	// keep in mind the rtable is sorted in decreasing order
+	while(left <= right) {
+
+		int mid = (left + right) / 2;
+
+		// if current entry and newly found are equal, compare masks
+		// except the case when current entry doesn't exist
+		if((ip & rtable[mid].mask) == rtable[mid].prefix)
+			if(!my_entry || ((my_entry != NULL) && (ntohl(my_entry->mask) < ntohl(rtable[mid].mask))))
+				my_entry = &rtable[mid];
+
+		if(ntohl(ip) >= ntohl(rtable[mid].prefix))
+			right = mid - 1;
+		else
+			left = mid + 1;
+	}
+
+	return my_entry;
+
 }
 
 struct arp_table_entry *get_arp_entry(uint32_t ip) {
@@ -33,7 +62,7 @@ struct arp_table_entry *get_arp_entry(uint32_t ip) {
 		if(arp_table[i].ip == ip)
 			return &arp_table[i];
 
-	return NULL;		
+	return NULL;	
 }
 
 int rtable_comparator(const void *a, const void *b) {
@@ -145,22 +174,88 @@ int populate_arp_header(char *buf, struct route_table_entry *route, uint8_t *mac
 	return len + sizeof(struct arp_header);
 }
 
+
+void echo_back(char *buf) {
+
+	struct iphdr *ip_header = (struct iphdr *)(buf + sizeof(struct ether_header));
+	struct icmphdr *icmp_header = (struct icmphdr *)(ip_header + 1);
+
+	// switch ip source and destination and recalculate checksum
+	uint32_t aux_addr = ip_header->saddr;
+	ip_header->saddr = ip_header->daddr;
+	ip_header->daddr = aux_addr;
+
+	ip_header->check = 0;
+	ip_header->check = htons(checksum((uint16_t *) ip_header, sizeof(struct iphdr)));
+
+	// switch icmp type and code for echo reply and recalculate checksum
+	icmp_header->type = icmp_header->code = 0;
+
+	icmp_header->checksum = 0;
+	icmp_header->checksum = htons(checksum((uint16_t *) icmp_header, sizeof(struct icmphdr)));
+}
+
+int build_icmp_by_type(int interface, char *buf, int len, uint8_t type) {
+
+	struct iphdr *ip_header = (struct iphdr *)(buf + sizeof(struct ether_header));
+	struct icmphdr *icmp_header = (struct icmphdr *)(ip_header + 1);
+
+	// populate code + type and calculate icmp checksum
+	icmp_header->code = 0;
+	icmp_header->type = type;
+
+	icmp_header->checksum = 0;
+	icmp_header->checksum = htons(checksum((u_int16_t *) icmp_header, sizeof(struct icmphdr)));
+
+	// copy first 64 bits of old ip data to end of icmp header
+	memcpy((icmp_header + 1), ip_header, 8);
+
+	// build new ip header
+	ip_header->daddr = ip_header->saddr;
+	ip_header->saddr = inet_addr(get_interface_ip(interface));
+
+	// update TTL to standardized max
+	ip_header->ttl = 64;
+
+	// change protocol of packet from ip to icmp
+	ip_header->protocol = IPPROTO_ICMP;
+
+	// modify packet length to encapsulate icmp header and 64 bit stuffing
+	// switch length to host order to properly add new length then switch back to network order
+	ip_header->tot_len = htons(ntohs(ip_header->tot_len) + sizeof(struct icmphdr) + 64);
+
+	ip_header->check = 0;
+	ip_header->check = htons(checksum((u_int16_t *) ip_header, sizeof(struct iphdr)));
+
+	return (len + sizeof(struct icmphdr) + 64);
+}
+
 void send_ip_packet(int interface, char *buf, int len) {
 
 	struct ether_header *eth_hdr = (struct ether_header *) buf;
 	struct iphdr *ip_header = (struct iphdr *)(buf + sizeof(struct ether_header));
 
+	// redirect icmp echo if router is destination
+	if(ip_header->daddr == inet_addr(get_interface_ip(interface)))
+		echo_back(buf);
 	
 
 	// Bad checksum, ignore
 	if(checksum((uint16_t *) ip_header, sizeof(struct iphdr)) != 0)
 		return;
+		
+	// Bad ttl, signal with icmp
+	if(ip_header->ttl <= 1)
+		len = build_icmp_by_type(interface, buf, len, TIMEOUT);
 
 	struct route_table_entry *best_route = get_best_route(ip_header->daddr);
-		
-	// Bad ttl, ignore
-	if(ip_header->ttl < 1)
-		return;
+
+	if(!best_route) {
+		len = build_icmp_by_type(interface, buf, len, NO_HOST);
+
+		// find route back because previous route was empty
+		best_route = get_best_route(ip_header->daddr);
+	}	
 
 	int old_ttl = ip_header->ttl;
 	int old_check = ip_header->check;
@@ -171,6 +266,7 @@ void send_ip_packet(int interface, char *buf, int len) {
 
 	// find mac address in arp table
 	struct arp_table_entry *arp_entry = get_arp_entry(best_route->next_hop);
+
 
 	// chache IP in queue and build ARP request if no MAC address is available
 	if(arp_entry == NULL) {
@@ -208,39 +304,6 @@ void send_ip_packet(int interface, char *buf, int len) {
 }
 
 
-void echo_back(int interface, char *buf, int len) {
-	struct iphdr *ip_header = (struct iphdr *)(buf + sizeof(struct ether_header));
-	struct icmphdr *icmp_header = (struct icmphdr *)(buf + sizeof(struct ether_header) + sizeof(struct iphdr));
-
-	//icmp_header->checksum = 0;
-	//icmp_header->checksum = htons(checksum((uint16_t *) icmp_header, sizeof(struct icmphdr)));
-
-	// switch ip source and destination
-
-	icmp_header->type = 0;
-	icmp_header->code = 0;
-
-	uint32_t aux_addr = ip_header->saddr;
-	ip_header->saddr = ip_header->daddr;
-	ip_header->daddr = aux_addr;
-
-
-	ip_header->check = 0;
-	ip_header->check = htons(checksum((uint16_t *) ip_header, sizeof(struct iphdr)));
-
-	ip_header->protocol = IPPROTO_ICMP;
-
-	// switch icmp type and code for echo reply
-	icmp_header->checksum = 0;
-	icmp_header->checksum = htons(checksum((uint16_t *) icmp_header, sizeof(struct icmphdr)));
-
-	// redo ethernet header to send back
-	// memcpy(eth_hdr->ether_dhost, eth_hdr->ether_shost, 6);
-	// get_interface_mac(interface, eth_hdr->ether_shost);
-
-	send_ip_packet(interface, buf, len);
-}
-
 int main(int argc, char *argv[])
 {
 	char buf[MAX_PACKET_LEN];
@@ -252,7 +315,6 @@ int main(int argc, char *argv[])
 	arp_table = malloc(60 * sizeof(struct arp_table_entry)); 
 
 	rtable_len = read_rtable(argv[1], rtable);
-	// arp_table_len = parse_arp_table("arp_table.txt", arp_table);
 	arp_table_len = 0;
 
 	qsort(rtable, rtable_len, sizeof(struct route_table_entry), rtable_comparator);
@@ -276,11 +338,6 @@ int main(int argc, char *argv[])
 
 		if(ntohs(eth_hdr->ether_type) == IP_ETHTYPE) {
 
-			if(((struct iphdr*) (buf + sizeof(struct ether_header)))->daddr == inet_addr(get_interface_ip(interface))) {
-				echo_back(interface, buf, len);
-				continue;
-			}
-	
 			send_ip_packet(interface, buf, len);
 
 		} else if(ntohs(eth_hdr->ether_type) == ARP_ETHTYPE) {
