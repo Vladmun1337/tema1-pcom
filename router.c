@@ -19,15 +19,13 @@ int arp_table_len;
 queue q;
 int q_len;
 
-// struct route_table_entry *get_best_route(uint32_t ip_dest) {
 
-// 	for(int i = 0; i < rtable_len; i++)
-// 		if((ip_dest & rtable[i].mask) == rtable[i].prefix)
-// 			return &rtable[i];
-
-// 	return NULL;
-// }
-
+/*
+ * Search best next hop in routing table
+ * Uses binary search comparing by prefix and mask
+ * Routing table is in NETWORK ORDER
+ * Params: ip - base ip that we will mask to find best prefix
+ */
 struct route_table_entry *get_best_route(uint32_t ip) {
 
 	struct route_table_entry *my_entry = NULL;
@@ -56,6 +54,11 @@ struct route_table_entry *get_best_route(uint32_t ip) {
 
 }
 
+/*
+ * Find MAC address in arp table
+ * Uses basic linear search
+ * Params: ip - ip address for the corresponding mac address in table
+ */
 struct arp_table_entry *get_arp_entry(uint32_t ip) {
 
 	for(int i = 0; i < arp_table_len; i++)
@@ -65,6 +68,12 @@ struct arp_table_entry *get_arp_entry(uint32_t ip) {
 	return NULL;	
 }
 
+/*
+ * Comparator for qsort function used to sort routing tablr
+ * Compares first the prefixes, in case of equality, compares masks
+ * comparison made in HOST ORDER DECREASINGLY
+ * PARAMS: a, b - entries in routing table to be compared cast as void pointers
+ */
 int rtable_comparator(const void *a, const void *b) {
 
     const struct route_table_entry *entry1 = (const struct route_table_entry *)a;
@@ -78,6 +87,12 @@ int rtable_comparator(const void *a, const void *b) {
     return (ntohl(entry1->mask) > ntohl(entry2->mask)) ? -1 : 1;
 }
 
+/*
+ * Handles arp request from specific host
+ * Changes the destination and source of arp packet
+ * Extracts MAC address of router and sends it back to host
+ * Params: See 'send_ip_packet()' 
+ */
 void parse_arp_request(int interface, char *buf, int len) {
 
 	struct ether_header *eth_hdr = (struct ether_header *) buf;
@@ -101,6 +116,13 @@ void parse_arp_request(int interface, char *buf, int len) {
 	send_to_link(interface, buf, len);
 }
 
+/*
+ * Extracts new MAC address from arp reply
+ * Adds MAC with corresponding ip to the arp table
+ * Searches for cached packets in queue that match newly added entry
+ * Sends any cached packet it finds and frees up queue
+ * Params: See 'send_ip_packet()' 
+ */
 void parse_arp_reply(int interface, char *buf, int len) {
 
 	struct arp_header *arp_hdr = (struct arp_header*) (buf + sizeof(struct ether_header));
@@ -140,6 +162,15 @@ void parse_arp_reply(int interface, char *buf, int len) {
 	q_len = new_len;
 }
 
+/*
+ * Builds a new cached packet for a packet that can't be sent at the moment
+ * Populates cache with packet's metadata (length, interface, next hop and data)
+ * Adds cache to queue and increases queue size
+ * Params:
+ * best_route - routing data for next hop and next interface needed
+ * buf - packet data
+ * len - packet length
+ */
 void pack_and_queue(struct route_table_entry *best_route, char *buf, int len) {
 
 	struct packet_cache *packet = malloc(sizeof(struct packet_cache));
@@ -154,16 +185,28 @@ void pack_and_queue(struct route_table_entry *best_route, char *buf, int len) {
 	q_len++;
 }
 
+/*
+ * Converts an ip packet to an ARP type by adding a specific header
+ * Destination MAC of IP packet is unknown so the router sends a broadcast to network
+ * Params:
+ * buf - packet
+ * route - rtable entry for best route
+ * mac - destination MAC address (RECOMMENDED: 255:255:255:255:255:255)
+ * len - packet length
+ */
 int populate_arp_header(char *buf, struct route_table_entry *route, uint8_t *mac, int len) {
 
 	struct arp_header *arp_hdr = (struct arp_header *) (buf + sizeof(struct ether_header));
 
+	// set packet type
 	arp_hdr->htype = htons(HTYPE_ETHER);
 	arp_hdr->ptype = htons(IP_ETHTYPE);
 
+	// MAC length and IP length
 	arp_hdr->hlen = 6;
 	arp_hdr->plen = 4;
 
+	// set arp type (request here) and build source-destination fields
 	arp_hdr->op = htons(OP_REQUEST);
 	arp_hdr->spa = inet_addr(get_interface_ip(route->interface));
 	get_interface_mac(route->interface, arp_hdr->sha);
@@ -171,10 +214,15 @@ int populate_arp_header(char *buf, struct route_table_entry *route, uint8_t *mac
 	arp_hdr->tpa = route->next_hop;
 	memcpy(arp_hdr->tha, mac, 6);
 
+	// return new length (original + header overhead)
 	return len + sizeof(struct arp_header);
 }
 
-
+/*
+ * Sends an ICMP echo reply to source of echo request
+ * Changes source-destination of packet and ICMP code + type
+ * Params: buf - packet
+*/
 void echo_back(char *buf) {
 
 	struct iphdr *ip_header = (struct iphdr *)(buf + sizeof(struct ether_header));
@@ -195,6 +243,16 @@ void echo_back(char *buf) {
 	icmp_header->checksum = htons(checksum((uint16_t *) icmp_header, sizeof(struct icmphdr)));
 }
 
+/*
+ * Converts an IP packet to ICMP
+ * ICMP reply will depend on provided code
+ * Saves first 64 bits of original IP request
+ * Params:
+ * interface - router's interface
+ * buf - packet
+ * len - packet length
+ * type - ICMP response type
+*/
 int build_icmp_by_type(int interface, char *buf, int len, uint8_t type) {
 
 	struct iphdr *ip_header = (struct iphdr *)(buf + sizeof(struct ether_header));
@@ -230,6 +288,20 @@ int build_icmp_by_type(int interface, char *buf, int len, uint8_t type) {
 	return (len + sizeof(struct icmphdr) + 64);
 }
 
+/*
+ * Redirects an IP packet
+ * Checks checksum, TTL in case of packet drop
+ * Searches next hop in routing table and MAC in arp table
+ * 
+ * NOTE:
+ * rtable miss    -> host unreachable ICMP conversion
+ * arp table miss -> sends ARP request to next hop IP for MAC address
+ * 
+ * Params:
+ * interface - router's interface
+ * buf - packet
+ * len - packet length
+ */
 void send_ip_packet(int interface, char *buf, int len) {
 
 	struct ether_header *eth_hdr = (struct ether_header *) buf;
@@ -343,8 +415,11 @@ int main(int argc, char *argv[])
 		} else if(ntohs(eth_hdr->ether_type) == ARP_ETHTYPE) {
 
 			if(ntohs(((struct arp_header*) (buf + sizeof(struct ether_header)))->op) == OP_REQUEST)
+
 				parse_arp_request(interface, buf, len);
+
 			else if(ntohs(((struct arp_header*) (buf + sizeof(struct ether_header)))->op) == OP_REPLY)
+
 				parse_arp_reply(interface, buf, len);
 		}
 	}
