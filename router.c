@@ -138,20 +138,20 @@ void parse_arp_reply(int interface, char *buf, int len) {
 	// check cached ip packets
 	while(q_len--) {
 		struct packet_cache *packet = (struct packet_cache *) queue_deq(q);
-		struct ether_header *curr_header = (struct ether_header *) packet->buf;
+		struct ether_header *packet_eth = (struct ether_header *) packet->buf;
 
 		// check if cached packet matches newly found address
 		if(ntohl(packet->next_hop) == ntohl(arp_hdr->spa)) {
 
 			// build packet ether header to send
-			get_interface_mac(packet->interface, curr_header->ether_shost);
-			memcpy(curr_header->ether_dhost, arp_hdr->sha, 6);
+			get_interface_mac(packet->interface, packet_eth->ether_shost);
+			memcpy(packet_eth->ether_dhost, arp_hdr->sha, 6);
 
 			send_to_link(packet->interface, packet->buf, packet->len);
 
 			// free memory and decrement total number of cached packets
 			free(packet);
-			free(curr_header);
+			//free(packet_eth);
 			new_len--;
 		} else {
 			// put packet back into queue
