@@ -151,7 +151,6 @@ void parse_arp_reply(int interface, char *buf, int len) {
 
 			// free memory and decrement total number of cached packets
 			free(packet);
-			//free(packet_eth);
 			new_len--;
 		} else {
 			// put packet back into queue
